@@ -1,0 +1,198 @@
+import torchvision.transforms as transforms
+import torchvision.datasets as datasets
+from torch.utils.data import DataLoader
+import tqdm
+import numpy as np
+import matplotlib.pyplot as plt
+import torch
+import torch.nn as nn
+from torch import optim
+import torch.nn.functional as F
+import pytorch_lightning as pl
+
+transform = transforms.Compose([
+    transforms.Resize(200),  # Resize the image to 200x200 pixels
+    transforms.ToTensor()    # Convert the image to a PyTorch tensor
+])
+
+dataset_train = datasets.ImageFolder('/content/NEU-DET/train/images', transform=transform)
+print(f'Number of images (all classes): {len(dataset_train)}')
+
+dataloader_train = DataLoader(dataset_train, batch_size=25, shuffle=True)
+for batch in dataloader_train:
+    print(batch)
+    break
+
+dataset_val = datasets.ImageFolder('/content/NEU-DET/validation/images', transform=transform)
+print(f'Number of images (all classes): {len(dataset_val)}')
+
+dataloader_val = DataLoader(dataset_val, batch_size=25, shuffle=True)
+for batch in dataloader_val:
+    print(batch)
+    break
+    
+class ConvBlock(nn.Module):                                                                  #CNN
+    def __init__(self, out_channels, kernel_size=3, stride=1, padding=1):
+        super(ConvBlock, self).__init__()
+        self.conv = nn.LazyConv2d(out_channels=out_channels, kernel_size=3, stride=1, padding=1)
+        self.relu = nn.LeakyReLU()
+        self.pool = nn.MaxPool2d(kernel_size=2, stride=2)
+
+    def forward(self, x):
+        x = self.conv(x)
+        x = self.relu(x)
+        x = self.pool(x)
+        return x
+
+
+class ClassifierCNN(pl.LightningModule):
+    def __init__(self, conv_channels, fc_dim, num_classes):
+        super(ClassifierCNN, self).__init__()
+        
+        conv_blocks = []
+        for i, c in enumerate(conv_channels):
+            conv_blocks.append( ConvBlock(c) )
+
+        self.conv = nn.Sequential(*conv_blocks)
+        self.fc = nn.Sequential(nn.LazyLinear(fc_dim),
+                                nn.LeakyReLU(),
+                                nn.LazyLinear(num_classes))
+
+        self.criterion = nn.CrossEntropyLoss()
+    
+    def forward(self, x):
+        x = self.conv(x)
+        x = x.view(x.shape[0], -1) 
+        x = self.fc(x)
+        return x
+
+    def training_step(self, batch, batch_idx):
+        x, y = batch
+        out = self(x)
+        loss = self.criterion(out, y)
+        self.log("train_loss", loss)
+        return loss
+
+    def configure_optimizers(self):
+        optimizer = optim.Adam(self.parameters(), lr=1e-3)
+        return optimizer
+        
+model = ClassifierCNN(conv_channels=[16, 32], fc_dim=64, num_classes=6)
+model(dataloader_train.dataset[0][0].unsqueeze(0))
+
+trainer = pl.Trainer(max_epochs=5)
+trainer.fit(model=model, train_dataloaders=dataloader_train)
+
+model.eval()                                                               #Train set
+with torch.no_grad():
+    correct = 0
+    total = 0
+    pbar = tqdm.tqdm(enumerate(dataloader_train), total=len(dataloader_train))
+    for i, (images, labels) in pbar:
+
+        # Forward pass
+        outputs = model(images)
+        _, predicted = torch.max(outputs.data, 1)
+        
+        # Compute accuracy
+        total += labels.size(0)
+        correct += (predicted == labels).sum().item()
+    
+    accuracy = 100 * correct / total
+    print(f'\nTrain Accuracy: {accuracy:.2f}%')
+
+y_pred_train = []
+y_true_train = []
+
+with torch.no_grad():                                                 
+    for x, y in dataloader_train:
+        outputs = model(x)
+        _, label = torch.max(outputs.data, 1)
+        y_pred_train += label.detach().numpy().tolist()
+        y_true_train += y.detach().numpy().tolist()
+
+y_pred_t = np.array(y_pred_train)
+y_true_t = np.array(y_true_train)
+
+classes = ["crazing", "inclusion", "patches", "pitted_surface", "rolled-in_scale", "scratches"]
+
+confusion = np.zeros([6, 6], dtype=int)
+for i in range(len(y_pred_t)):
+    row_idx = y_pred_t[i].round()
+    col_idx = y_true_t[i].round()
+    confusion[row_idx.astype(int), col_idx.astype(int)] += 1
+
+fig, ax = plt.subplots()
+im = ax.imshow(confusion, 'Blues')
+cb = plt.colorbar(im)
+cb.set_label('Frequency')
+_ = ax.set_xticks(np.arange(len(classes)))
+_ = ax.set_yticks(np.arange(len(classes)))
+_ = ax.set_xticklabels(classes, rotation=90)
+_ = ax.set_yticklabels(classes)
+_ = ax.set_xlabel('True label')
+_ = ax.set_ylabel('Predicted label')
+
+for i in range(len(classes)):
+    for j in range(len(classes)):
+        if confusion[i, j] > 100:
+            tc = 'w'
+        else:
+            tc = 'k'
+        ax.text(i, j, confusion[i, j], ha='center', va="center", color=tc)
+ 
+with torch.no_grad():
+    correct = 0
+    total = 0
+    pbar = tqdm.tqdm(enumerate(dataloader_val), total=len(dataloader_val))
+    for i, (images, labels) in pbar:
+
+        # Forward pass
+        outputs = model(images)
+        _, predicted = torch.max(outputs.data, 1)
+        
+        # Compute accuracy
+        total += labels.size(0)
+        correct += (predicted == labels).sum().item()
+    
+    accuracy = 100 * correct / total
+    print(f'\nVal Accuracy: {accuracy:.2f}%')
+
+y_pred_val = []
+y_true_val = []
+
+with torch.no_grad():
+    for x, y in dataloader_val:
+        outputs = model(x)
+        _, label = torch.max(outputs.data, 1)
+        y_pred_val += label.detach().numpy().tolist()
+        y_true_val += y.detach().numpy().tolist()
+
+y_pred_v = np.array(y_pred_val)
+y_true_v = np.array(y_true_val)
+
+confusion = np.zeros([6, 6], dtype=int)
+for i in range(len(y_pred_v)):
+    row_idx = y_pred_v[i].round()
+    col_idx = y_true_v[i].round()
+    confusion[row_idx.astype(int), col_idx.astype(int)] += 1
+
+fig, ax = plt.subplots()
+im = ax.imshow(confusion, 'Blues')
+cb = plt.colorbar(im)
+cb.set_label('Frequency')
+_ = ax.set_xticks(np.arange(len(classes)))
+_ = ax.set_yticks(np.arange(len(classes)))
+_ = ax.set_xticklabels(classes, rotation=90)
+_ = ax.set_yticklabels(classes)
+_ = ax.set_xlabel('True label')
+_ = ax.set_ylabel('Predicted label')
+
+for i in range(6):
+    for j in range(6):
+        if confusion[i, j] > 100:
+            tc = 'w'
+        else:
+            tc = 'k'
+        ax.text(i, j, confusion[i, j], ha='center', va="center", color=tc)
+    
